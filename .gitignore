@@ -4,8 +4,72 @@
 *.safetensors
 
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Virtual env / tooling
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.idea/
+.vscode/
+
+# Build / dist
+build/
+dist/
+
+# Outputs & temp
 output/
+output_custom/
+output_test/
+tmp/
+samples/Gradio-*/
+wandb/
+.cache/
+pip-wheel-metadata/
+
+# Checkpoints (prevent large weights). Force add if needed: git add -f checkpoints/model.bin
 checkpoints/
+!checkpoints/README.md
+
+# Generated media (limit ignoring to output dirs so source assets/*.png remain tracked)
+output*/**/*.wav
+output*/**/*.mp3
+output*/**/*.gif
+output*/**/*.jpg
+output*/**/*.png
+output*/**/*.log
+tmp/**/*.wav
+tmp/**/*.mp3
+
+# Large binary artifacts (general)
+*.ckpt
+*.pt
+*.safetensors
+*.bin
+
+# Logs
+*.log
+
+# CSV data artifacts (allow project-level csv if explicitly added)
+*.csv
+
+# DO NOT ignore configs / metadata (removed previous *.json, *.txt)
+# If you intentionally want to ignore specific huge json: add path like data/raw/*.json
+
+# Keep requirement freeze even if patterns above change later
+!requirements/requirements-current.txt
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Local training folders if created
 train/
 configs/
 
@@ -19,5 +83,5 @@ configs/
 *.json
 
 *.csv
-*.txt
+
 *.bin

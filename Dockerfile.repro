@@ -1,0 +1,44 @@
+## Reproducible Dockerfile capturing the CURRENT runtime environment exactly
+## Generated: 2025-08-27
+## Build: docker build -f Dockerfile.repro -t foleycrafter-lock:latest .
+## Run:   docker run --gpus all -it --rm foleycrafter-lock:latest bash
+## Notes:
+##  - Uses same base image as original (CUDA 11.8 runtime, Ubuntu 22.04)
+##  - Installs pinned Python packages from requirements/requirements-current.txt with PyTorch extra index
+##  - Keeps xformers version even though it emits a CUDA build mismatch warning (faithful reproduction)
+
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Seoul \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+## System packages (match original baseline) -- avoid version pinning to leverage base image security updates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    git git-lfs ffmpeg \
+    libsndfile1 \
+    libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
+    ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --upgrade pip wheel setuptools
+
+## Copy project (adjust if you only need runtime code vs full repo)
+COPY . /app
+
+## Install EXACT pinned Python deps (torch/cu118 wheels via extra index)
+RUN python3 -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 -r requirements/requirements-current.txt \
+  && python3 - <<'PY' || true
+import torch, torchvision, torchaudio, diffusers, transformers, xformers
+print('torch',torch.__version__,'cuda',torch.version.cuda,'available',torch.cuda.is_available())
+print('torchvision',torchvision.__version__,'torchaudio',torchaudio.__version__)
+print('diffusers',diffusers.__version__,'transformers',transformers.__version__,'xformers',xformers.__version__)
+PY
+
+EXPOSE 7860
+CMD ["/bin/bash"]

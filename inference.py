@@ -3,6 +3,7 @@ import glob
 import os
 import os.path as osp
 from pathlib import Path
+import re
 
 import soundfile as sf
 import torch
@@ -34,7 +35,21 @@ def args_parse():
     config.add_argument("--temporal_scale", type=float, default=0.2, help="temporal align scale")
     config.add_argument("--input", type=str, default="examples/sora", help="input video folder path")
     config.add_argument("--ckpt", type=str, default="checkpoints/", help="checkpoints folder path")
-    config.add_argument("--save_dir", type=str, default="output/", help="generation result save path")
+    # Default output directory changed back to 'output_analysis' per request
+    config.add_argument("--save_dir", type=str, default="output_analysis/", help="generation result save path")
+    config.add_argument(
+        "--recursive",
+        action="store_true",
+        help="recursively search for video files inside the input directory (mp4, mov, mkv, webm)",
+    )
+    config.add_argument(
+        "--pre_download_only",
+        action="store_true",
+        help="only download/load all model weights then exit (warm cache)",
+    )
+    config.add_argument(
+        "--num_inference_steps", type=int, default=25, help="diffusion inference steps (quality vs speed tradeoff)"
+    )
     config.add_argument(
         "--pretrain",
         type=str,
@@ -47,28 +62,36 @@ def args_parse():
 
 
 def build_models(config):
-    # download ckpt
+    print("[Build] Preparing models...")
+    # download ckpt (generator)
     pretrained_model_name_or_path = config.pretrain
     if not os.path.isdir(pretrained_model_name_or_path):
+        print(f"[Build] Downloading generator weights: {pretrained_model_name_or_path}")
         pretrained_model_name_or_path = snapshot_download(pretrained_model_name_or_path)
 
     fc_ckpt = "ymzhang319/FoleyCrafter"
-    if not os.path.isdir(fc_ckpt):
+    if not os.path.isdir(osp.join(config.ckpt, "vocoder")):
+        print("[Build] Downloading FoleyCrafter full checkpoint bundle (vocoder + adapters)...")
         fc_ckpt = snapshot_download(fc_ckpt, local_dir=config.ckpt)
+    else:
+        fc_ckpt = config.ckpt
 
     # ckpt path
     temporal_ckpt_path = osp.join(config.ckpt, "temporal_adapter.ckpt")
 
     # load vocoder
     vocoder_config_path = fc_ckpt
+    print("[Build] Loading vocoder...")
     vocoder = Generator.from_pretrained(vocoder_config_path, subfolder="vocoder").to(config.device)
 
     # load time_detector
     time_detector_ckpt = osp.join(osp.join(config.ckpt, "timestamp_detector.pth.tar"))
+    print("[Build] Loading time detector...")
     time_detector = VideoOnsetNet(False)
     time_detector, _ = torch_utils.load_model(time_detector_ckpt, time_detector, device=config.device, strict=True)
 
     # load adapters
+    print("[Build] Loading diffusion pipeline (this can take a while the first time)...")
     pipe = build_foleycrafter().to(config.device)
     ckpt = torch.load(temporal_ckpt_path)
 
@@ -82,7 +105,7 @@ def build_models(config):
         else:
             load_gligen_ckpt[key] = value
     m, u = pipe.controlnet.load_state_dict(load_gligen_ckpt, strict=False)
-    print(f"### Control Net missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
+    print(f"[Build] ControlNet loaded (missing={len(m)}, unexpected={len(u)})")
 
     # load semantic adapter
     pipe.load_ip_adapter(
@@ -90,6 +113,8 @@ def build_models(config):
     )
     ip_adapter_weight = config.semantic_scale
     pipe.set_ip_adapter_scale(ip_adapter_weight)
+    print("[Build] Semantic (IP-Adapter) scale set to", ip_adapter_weight)
+    print("[Build] All models ready.")
 
     return pipe, vocoder, time_detector
 
@@ -97,9 +122,36 @@ def build_models(config):
 def run_inference(config, pipe, vocoder, time_detector):
     controlnet_conditioning_scale = config.temporal_scale
     os.makedirs(config.save_dir, exist_ok=True)
-
-    input_list = glob.glob(f"{config.input}/*.mp4")
-    assert len(input_list) != 0, "input list is empty!"
+    # Accept both file and directory input
+    raw_input_path = osp.abspath(config.input)
+    if not osp.exists(raw_input_path):
+        # Auto-fallback: if user passed a relative path that actually exists under /data
+        candidate = osp.join('/data', config.input.lstrip('/'))
+        if osp.exists(candidate):
+            print(f"[Info] Input path not found at {raw_input_path}, using data fallback {candidate}")
+            raw_input_path = candidate
+    patterns = ["*.mp4", "*.MP4", "*.mov", "*.MOV", "*.mkv", "*.MKV", "*.webm", "*.WEBM"]
+    if osp.isfile(raw_input_path):
+        input_list = [raw_input_path]
+    else:
+        if not osp.isdir(raw_input_path):
+            raise FileNotFoundError(
+                f"Input path not found: {raw_input_path}. Provide a file or directory containing videos (checked also /data fallback)."
+            )
+        input_list = []
+        if config.recursive:
+            for root, _, _ in os.walk(raw_input_path):
+                for p in patterns:
+                    input_list.extend(glob.glob(osp.join(root, p)))
+        else:
+            for p in patterns:
+                input_list.extend(glob.glob(osp.join(raw_input_path, p)))
+        input_list = sorted(list({osp.abspath(p) for p in input_list}))
+    if len(input_list) == 0:
+        raise RuntimeError(
+            f"No video files found in {raw_input_path} (recursive={config.recursive}). Supported extensions: {patterns}."
+        )
+    print(f"[Run] Found {len(input_list)} video(s) to process.")
 
     generator = torch.Generator(device=config.device)
     generator.manual_seed(config.seed)
@@ -143,6 +195,10 @@ def run_inference(config, pipe, vocoder, time_detector):
 
             name = Path(input_video).stem
             name = name.replace("+", " ")
+            # Sanitize filename: remove illegal chars, leading dashes (ffmpeg treats leading '-' as option)
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).lstrip("-_")
+            if not safe_name:
+                safe_name = "out"
 
             sample = pipe(
                 prompt=config.prompt,
@@ -151,7 +207,7 @@ def run_inference(config, pipe, vocoder, time_detector):
                 image=time_condition,
                 # audio_length_in_s=10,
                 controlnet_conditioning_scale=controlnet_conditioning_scale,
-                num_inference_steps=25,
+                num_inference_steps=config.num_inference_steps,
                 height=256,
                 width=1024,
                 output_type="pt",
@@ -167,19 +223,51 @@ def run_inference(config, pipe, vocoder, time_detector):
             os.makedirs(video_save_path, exist_ok=True)
             audio = audio[: int(duration * 16000)]
 
-            save_path = osp.join(audio_save_path, f"{name}.wav")
+            save_path = osp.join(audio_save_path, f"{safe_name}.wav")
             sf.write(save_path, audio, 16000)
 
-            audio = AudioFileClip(osp.join(audio_save_path, f"{name}.wav"))
-            video = VideoFileClip(input_video)
-            audio = audio.subclip(0, duration)
-            video.audio = audio
-            video = video.subclip(0, duration)
+            # Re-open audio/video and compose final output with robust duration handling.
+            # MoviePy sometimes requests audio frames a few ms past the declared duration due to rounding.
+            # We therefore trim BOTH streams to the common minimum minus a tiny safety margin.
+            final_audio_path = osp.join(audio_save_path, f"{safe_name}.wav")
             os.makedirs(video_save_path, exist_ok=True)
-            video.write_videofile(osp.join(video_save_path, f"{name}.mp4"))
+            video_out = osp.join(video_save_path, f"{safe_name}.mp4")
+
+            # Allow user override of safety margin via env var (seconds).
+            try:
+                safety_margin = float(os.environ.get("FOLEY_SAFETY_MARGIN", "0.02"))
+            except ValueError:
+                safety_margin = 0.02
+
+            # Open clips inside context managers to ensure proper release.
+            with AudioFileClip(final_audio_path) as audio_clip, VideoFileClip(input_video) as video_clip:
+                # Determine reliable duration values from actual clips (could differ slightly from 'duration').
+                clip_audio_dur = getattr(audio_clip, 'duration', duration)
+                clip_video_dur = getattr(video_clip, 'duration', duration)
+                final_duration = min(duration, clip_audio_dur, clip_video_dur)
+                # Apply safety margin but keep non-negative
+                final_duration = max(0.0, final_duration - safety_margin)
+                if final_duration <= 0:
+                    print(f"[Warn] Non-positive final duration computed for {safe_name}, skipping mux.")
+                else:
+                    # Trim to aligned common duration
+                    trimmed_audio = audio_clip.subclip(0, final_duration)
+                    trimmed_video = video_clip.subclip(0, final_duration)
+                    composite = trimmed_video.set_audio(trimmed_audio)
+                    # Explicitly set audio fps to match generation (16k) for consistency.
+                    composite.write_videofile(
+                        video_out,
+                        audio_fps=16000,
+                        verbose=False,
+                        logger=None,
+                    )
+                    print(f"[Done] Wrote {video_out} (duration ~{final_duration:.3f}s)")
 
 
 if __name__ == "__main__":
     config = args_parse()
     pipe, vocoder, time_detector = build_models(config)
-    run_inference(config, pipe, vocoder, time_detector)
+    if config.pre_download_only:
+        print("[Exit] Pre-download complete. Exiting as requested.")
+    else:
+        run_inference(config, pipe, vocoder, time_detector)
