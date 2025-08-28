@@ -21,3 +21,6 @@ configs/
 *.csv
 *.txt
 *.bin
+
+dataset/
+tmp_audio/

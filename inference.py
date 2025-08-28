@@ -3,6 +3,7 @@ import glob
 import os
 import os.path as osp
 from pathlib import Path
+from datetime import datetime
 
 import soundfile as sf
 import torch
@@ -141,8 +142,9 @@ def run_inference(config, pipe, vocoder, time_detector):
             neg_image_embeddings = torch.zeros_like(image_embeddings)
             image_embeddings = torch.cat([neg_image_embeddings, image_embeddings], dim=1)
 
-            name = Path(input_video).stem
-            name = name.replace("+", " ")
+            base_name = Path(input_video).stem.replace("+", " ")
+            timestamp = datetime.now().strftime("%m%d%H%M")  # MMDDHHMM
+            name = f"{base_name}_gen_{timestamp}"
 
             sample = pipe(
                 prompt=config.prompt,
@@ -170,13 +172,43 @@ def run_inference(config, pipe, vocoder, time_detector):
             save_path = osp.join(audio_save_path, f"{name}.wav")
             sf.write(save_path, audio, 16000)
 
-            audio = AudioFileClip(osp.join(audio_save_path, f"{name}.wav"))
-            video = VideoFileClip(input_video)
-            audio = audio.subclip(0, duration)
-            video.audio = audio
-            video = video.subclip(0, duration)
-            os.makedirs(video_save_path, exist_ok=True)
-            video.write_videofile(osp.join(video_save_path, f"{name}.mp4"))
+            try:
+                audio_clip = AudioFileClip(osp.join(audio_save_path, f"{name}.wav"))
+                video_clip = VideoFileClip(input_video)
+                # 실제 길이(초) 가져와서 float 오차로 0.0x 초 넘기는 문제 방지
+                real_audio_dur = getattr(audio_clip, "duration", duration)
+                real_video_dur = getattr(video_clip, "duration", duration)
+                safe_end = min(duration, real_audio_dur, real_video_dur)
+                # float 경계 접근 오류 방지를 위한 epsilon 조정
+                if safe_end <= 0:
+                    safe_end = min(real_audio_dur, real_video_dur) * 0.99
+                epsilon = 1e-3
+                safe_end = max(0.01, safe_end - epsilon)
+                audio_clip = audio_clip.subclip(0, safe_end)
+                video_clip = video_clip.subclip(0, safe_end)
+                video_clip.audio = audio_clip
+                os.makedirs(video_save_path, exist_ok=True)
+                out_path = osp.join(video_save_path, f"{name}.mp4")
+                # Explicit codecs to avoid environment-dependent failures
+                video_clip.write_videofile(
+                    out_path,
+                    codec="libx264",
+                    audio_codec="aac",
+                    temp_audiofile=osp.join(video_save_path, f"{name}_temp-audio.m4a"),
+                    remove_temp=True,
+                    verbose=False,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] Failed to mux video for {input_video}: {e}")
+            finally:
+                try:
+                    audio_clip.close()
+                except Exception:
+                    pass
+                try:
+                    video_clip.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
